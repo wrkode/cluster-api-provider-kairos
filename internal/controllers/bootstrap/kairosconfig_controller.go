@@ -33,14 +33,17 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/util"
-	"sigs.k8s.io/cluster-api/util/conditions"
+	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
@@ -50,7 +53,13 @@ import (
 const controlPlaneLBServiceSuffix = "control-plane-lb"
 
 var errLBEndpointNotReady = errors.New("control plane load balancer endpoint not ready")
-var errK3sTokenNotReady = errors.New("k3s token secret not ready")
+
+// errTokenNotReady signals that a referenced join-token Secret does not exist
+// yet (the controller has not generated it, or the init node has not pushed it
+// over the node-push channel). reconcileBootstrapData maps it to a timed
+// requeue rather than a hard failure. (Formerly errK3sTokenNotReady; generalized
+// for the Phase-3 control-plane-join token path — ADR 0005.)
+var errTokenNotReady = errors.New("join token secret not ready")
 
 // KairosConfigReconciler reconciles a KairosConfig object.
 //
@@ -253,7 +262,7 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 		})
 		vsphereMachineKey := types.NamespacedName{
 			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
+			Namespace: machine.Namespace,
 		}
 
 		if err := r.Get(ctx, vsphereMachineKey, vsphereMachine); err == nil {
@@ -293,14 +302,8 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 	// For CAPK: Only wait for providerID if KubevirtMachine is Ready (VM already provisioned)
 	// If KubevirtMachine is not Ready yet, allow secret creation so VM can be provisioned
 	if machine != nil && (machine.Spec.InfrastructureRef.Kind == "KubevirtMachine" || machine.Spec.InfrastructureRef.Kind == "KubeVirtMachine") && currentProviderID == "" {
-		kubevirtMachine := &unstructured.Unstructured{}
-		kubevirtMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		kubevirtMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-
-		if err := r.Get(ctx, kubevirtMachineKey, kubevirtMachine); err == nil {
+		kubevirtMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
+		if err == nil {
 			isReady := false
 			if ready, found, _ := unstructured.NestedBool(kubevirtMachine.Object, "status", "ready"); found && ready {
 				isReady = true
@@ -325,13 +328,13 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 			if isReady {
 				log.V(4).Info("KubevirtMachine is Ready but providerID not yet set, waiting briefly for CAPK to set it",
 					"machine", machine.Name,
-					"kubevirtMachine", kubevirtMachineKey.Name)
+					"kubevirtMachine", machine.Spec.InfrastructureRef.Name)
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 
 			log.V(5).Info("KubevirtMachine not Ready yet, proceeding with bootstrap secret creation",
 				"machine", machine.Name,
-				"kubevirtMachine", kubevirtMachineKey.Name)
+				"kubevirtMachine", machine.Spec.InfrastructureRef.Name)
 		}
 	}
 
@@ -473,8 +476,8 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 			log.Info("Waiting for control plane LoadBalancer endpoint before generating cloud-config")
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
-		if errors.Is(err, errK3sTokenNotReady) {
-			log.Info("Waiting for k3s token secret before generating cloud-config")
+		if errors.Is(err, errTokenNotReady) {
+			log.Info("Waiting for join token secret before generating cloud-config")
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("failed to generate cloud-config: %w", err)
@@ -840,6 +843,80 @@ func (r *KairosConfigReconciler) generateCloudConfig(ctx context.Context, log lo
 	}
 }
 
+// applyControlPlaneRenderData wires the HA control-plane fields onto td: the
+// init/join/single role, the resolved join token, and the kube-vip VIP block
+// (ADR 0005 Phase 3). It is the render-side enforcement of CPR-INV-1: it is a
+// NO-OP unless role == "control-plane", so a worker KairosConfig that carries a
+// controlPlaneRole/VIP (operator-poisoned or stale) never produces a
+// control-plane HA artifact. CPR-INV-2 (empty role ≡ single) is handled by the
+// TemplateData helpers in internal/bootstrap.
+//
+// The join token is resolved from the distribution-appropriate *SecretRef
+// (TOKEN-INV: *SecretRef only). A missing token Secret surfaces as
+// errTokenNotReady so reconcileBootstrapData requeues — the init node may not
+// have pushed the k0s controller-join token yet. The token is never logged.
+func (r *KairosConfigReconciler) applyControlPlaneRenderData(ctx context.Context, td *bootstrap.TemplateData, kairosConfig *bootstrapv1beta2.KairosConfig, cluster *clusterv1.Cluster, role string) error {
+	if role != "control-plane" {
+		return nil // CPR-INV-1: workers never consume ControlPlaneRole/VIP.
+	}
+	td.ControlPlaneRole = string(kairosConfig.Spec.ControlPlaneRole)
+
+	// VIP is consulted by the renderer only on init/join (RenderKubeVIP gate),
+	// but copying it whenever present keeps the conversion in one place.
+	if v := kairosConfig.Spec.ControlPlaneVIP; v != nil {
+		td.VIP = &bootstrap.VIPConfig{
+			Address:   v.Address,
+			Interface: v.Interface,
+			Mode:      v.Mode,
+		}
+	}
+
+	distribution := kairosConfig.Spec.Distribution
+	if distribution == "" {
+		distribution = "k0s"
+	}
+
+	// ADR 0005 §E.1: every HA control-plane node (init AND join) reports its own
+	// etcd member health into the per-cluster etcd-status Secret over the
+	// node-push channel. The renderer needs the target Secret name to build that
+	// reporter block. Not for single-node (no quorum to report) or workers.
+	if td.ManagementEndpoint != nil && cluster != nil {
+		switch kairosConfig.Spec.ControlPlaneRole {
+		case bootstrapv1beta2.ControlPlaneRoleInit, bootstrapv1beta2.ControlPlaneRoleJoin:
+			td.ManagementEndpoint.EtcdStatusSecretName = bootstrapv1beta2.EtcdStatusSecretName(cluster.Name)
+		}
+	}
+
+	// The join token is only meaningful for init/join nodes. single needs none.
+	switch kairosConfig.Spec.ControlPlaneRole {
+	case bootstrapv1beta2.ControlPlaneRoleInit:
+		// k0s init: the token does not exist until the node is up. The init node
+		// mints it via `k0s token create` and pushes it over the node-push
+		// channel; the renderer needs the target Secret name to build that push
+		// block. The init node does NOT embed a token in its own k0s config.
+		if distribution == "k0s" {
+			if td.ManagementEndpoint != nil && cluster != nil {
+				td.ManagementEndpoint.JoinTokenSecretName = bootstrapv1beta2.ControlPlaneJoinTokenSecretName(cluster.Name)
+			}
+			break
+		}
+		// k3s init carries the controller-generated shared server token (written
+		// to the token file for BOTH init and join per BLOCKER-1).
+		token, err := r.resolveToken(ctx, tokenKindControlPlaneJoin, kairosConfig, cluster)
+		if err != nil {
+			return err
+		}
+		td.JoinToken = token
+	case bootstrapv1beta2.ControlPlaneRoleJoin:
+		token, err := r.resolveToken(ctx, tokenKindControlPlaneJoin, kairosConfig, cluster)
+		if err != nil {
+			return err
+		}
+		td.JoinToken = token
+	}
+	return nil
+}
+
 // resolveUserPassword returns the user password for the default user, in
 // precedence order: UserPasswordSecretRef > inline UserPassword > "" (empty).
 //
@@ -893,64 +970,20 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 		}
 	}
 
-	// Get worker token if needed (for worker nodes)
-	// Precedence: WorkerTokenSecretRef > WorkerToken > TokenSecretRef > Token
-	// TODO: Add validating webhook to enforce worker token requirement at API level
+	// Get worker token if needed (for worker nodes).
+	// Precedence (tokenKindK0sWorker): WorkerTokenSecretRef > WorkerToken >
+	// TokenSecretRef > Token. Resolution is centralized in resolveToken
+	// (tokens.go). NOTE: a missing referenced Secret now surfaces as
+	// errTokenNotReady (timed requeue) rather than a hard error, aligning the
+	// k0s worker path with the k3s worker path's pre-existing requeue behavior;
+	// a missing token Secret is transient, not terminal.
 	var workerToken string
 	if role == "worker" {
-		// Try WorkerTokenSecretRef first (most secure)
-		if kairosConfig.Spec.WorkerTokenSecretRef != nil {
-			secretKey := types.NamespacedName{
-				Namespace: kairosConfig.Namespace,
-				Name:      kairosConfig.Spec.WorkerTokenSecretRef.Name,
-			}
-			// Use specified namespace or fall back to KairosConfig namespace
-			if kairosConfig.Spec.WorkerTokenSecretRef.Namespace != "" {
-				secretKey.Namespace = kairosConfig.Spec.WorkerTokenSecretRef.Namespace
-			}
-
-			secret := &corev1.Secret{}
-			if err := r.Get(ctx, secretKey, secret); err != nil {
-				return "", fmt.Errorf("failed to get worker token secret %s/%s: %w", secretKey.Namespace, secretKey.Name, err)
-			}
-
-			// Use specified key or default to "token"
-			key := kairosConfig.Spec.WorkerTokenSecretRef.Key
-			if key == "" {
-				key = "token"
-			}
-
-			if tokenData, ok := secret.Data[key]; ok {
-				workerToken = string(tokenData)
-			} else {
-				return "", fmt.Errorf("worker token secret %s/%s does not contain key '%s'", secretKey.Namespace, secretKey.Name, key)
-			}
-		} else if kairosConfig.Spec.WorkerToken != "" {
-			// Fall back to inline WorkerToken
-			workerToken = kairosConfig.Spec.WorkerToken
-		} else if kairosConfig.Spec.TokenSecretRef != nil {
-			// Fall back to legacy TokenSecretRef
-			secret := &corev1.Secret{}
-			secretKey := types.NamespacedName{
-				Namespace: cluster.Namespace,
-				Name:      kairosConfig.Spec.TokenSecretRef.Name,
-			}
-			if err := r.Get(ctx, secretKey, secret); err != nil {
-				return "", fmt.Errorf("failed to get token secret: %w", err)
-			}
-			// Try common token keys
-			if tokenData, ok := secret.Data["token"]; ok {
-				workerToken = string(tokenData)
-			} else if tokenData, ok := secret.Data["value"]; ok {
-				workerToken = string(tokenData)
-			} else {
-				return "", fmt.Errorf("token secret does not contain 'token' or 'value' key")
-			}
-		} else if kairosConfig.Spec.Token != "" {
-			// Fall back to legacy Token
-			workerToken = kairosConfig.Spec.Token
+		var err error
+		workerToken, err = r.resolveToken(ctx, tokenKindK0sWorker, kairosConfig, cluster)
+		if err != nil {
+			return "", err
 		}
-
 		// Validate worker token is present
 		if workerToken == "" {
 			return "", fmt.Errorf("worker token is required for worker nodes: either WorkerTokenSecretRef, WorkerToken, TokenSecretRef, or Token must be set")
@@ -1101,6 +1134,11 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 		templateData.ControlPlaneLBEndpoint = lbEndpoint
 	}
 
+	// HA: role / join token / VIP (ADR 0005 Phase 3). No-op on workers (CPR-INV-1).
+	if err := r.applyControlPlaneRenderData(ctx, &templateData, kairosConfig, cluster, role); err != nil {
+		return "", err
+	}
+
 	// Render template
 	return bootstrap.RenderK0sCloudConfig(templateData)
 }
@@ -1115,89 +1153,18 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 		}
 	}
 
-	// Resolve k3s token if needed (for worker nodes)
-	// Precedence: K3sTokenSecretRef > K3sToken > WorkerTokenSecretRef > WorkerToken > TokenSecretRef > Token
+	// Resolve k3s token if needed (for worker nodes).
+	// Precedence (tokenKindK3sWorker): K3sTokenSecretRef > K3sToken >
+	// WorkerTokenSecretRef > WorkerToken > TokenSecretRef > Token. Resolution is
+	// centralized in resolveToken (tokens.go); a missing referenced Secret
+	// surfaces as errTokenNotReady (timed requeue), preserving the pre-refactor
+	// behavior of this path.
 	var k3sToken string
 	if role == "worker" {
-		if kairosConfig.Spec.K3sTokenSecretRef != nil {
-			secretKey := types.NamespacedName{
-				Namespace: kairosConfig.Namespace,
-				Name:      kairosConfig.Spec.K3sTokenSecretRef.Name,
-			}
-			if kairosConfig.Spec.K3sTokenSecretRef.Namespace != "" {
-				secretKey.Namespace = kairosConfig.Spec.K3sTokenSecretRef.Namespace
-			}
-
-			secret := &corev1.Secret{}
-			if err := r.Get(ctx, secretKey, secret); err != nil {
-				if apierrors.IsNotFound(err) {
-					return "", errK3sTokenNotReady
-				}
-				return "", fmt.Errorf("failed to get k3s token secret %s/%s: %w", secretKey.Namespace, secretKey.Name, err)
-			}
-
-			key := kairosConfig.Spec.K3sTokenSecretRef.Key
-			if key == "" {
-				key = "token"
-			}
-
-			if tokenData, ok := secret.Data[key]; ok {
-				k3sToken = string(tokenData)
-			} else {
-				return "", fmt.Errorf("k3s token secret %s/%s does not contain key '%s'", secretKey.Namespace, secretKey.Name, key)
-			}
-		} else if kairosConfig.Spec.K3sToken != "" {
-			k3sToken = kairosConfig.Spec.K3sToken
-		} else if kairosConfig.Spec.WorkerTokenSecretRef != nil {
-			secretKey := types.NamespacedName{
-				Namespace: kairosConfig.Namespace,
-				Name:      kairosConfig.Spec.WorkerTokenSecretRef.Name,
-			}
-			if kairosConfig.Spec.WorkerTokenSecretRef.Namespace != "" {
-				secretKey.Namespace = kairosConfig.Spec.WorkerTokenSecretRef.Namespace
-			}
-
-			secret := &corev1.Secret{}
-			if err := r.Get(ctx, secretKey, secret); err != nil {
-				if apierrors.IsNotFound(err) {
-					return "", errK3sTokenNotReady
-				}
-				return "", fmt.Errorf("failed to get worker token secret %s/%s: %w", secretKey.Namespace, secretKey.Name, err)
-			}
-
-			key := kairosConfig.Spec.WorkerTokenSecretRef.Key
-			if key == "" {
-				key = "token"
-			}
-
-			if tokenData, ok := secret.Data[key]; ok {
-				k3sToken = string(tokenData)
-			} else {
-				return "", fmt.Errorf("worker token secret %s/%s does not contain key '%s'", secretKey.Namespace, secretKey.Name, key)
-			}
-		} else if kairosConfig.Spec.WorkerToken != "" {
-			k3sToken = kairosConfig.Spec.WorkerToken
-		} else if kairosConfig.Spec.TokenSecretRef != nil {
-			secretKey := types.NamespacedName{
-				Namespace: cluster.Namespace,
-				Name:      kairosConfig.Spec.TokenSecretRef.Name,
-			}
-			secret := &corev1.Secret{}
-			if err := r.Get(ctx, secretKey, secret); err != nil {
-				if apierrors.IsNotFound(err) {
-					return "", errK3sTokenNotReady
-				}
-				return "", fmt.Errorf("failed to get token secret: %w", err)
-			}
-			if tokenData, ok := secret.Data["token"]; ok {
-				k3sToken = string(tokenData)
-			} else if tokenData, ok := secret.Data["value"]; ok {
-				k3sToken = string(tokenData)
-			} else {
-				return "", fmt.Errorf("token secret does not contain 'token' or 'value' key")
-			}
-		} else if kairosConfig.Spec.Token != "" {
-			k3sToken = kairosConfig.Spec.Token
+		var err error
+		k3sToken, err = r.resolveToken(ctx, tokenKindK3sWorker, kairosConfig, cluster)
+		if err != nil {
+			return "", err
 		}
 
 		if k3sToken == "" {
@@ -1337,6 +1304,11 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 		templateData.ControlPlaneLBEndpoint = lbEndpoint
 	}
 
+	// HA: role / join token / VIP (ADR 0005 Phase 3). No-op on workers (CPR-INV-1).
+	if err := r.applyControlPlaneRenderData(ctx, &templateData, kairosConfig, cluster, role); err != nil {
+		return "", err
+	}
+
 	return bootstrap.RenderK3sCloudConfig(templateData)
 }
 
@@ -1458,6 +1430,22 @@ func (r *KairosConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.secretToKairosConfig),
 		).
+		// HA join-token Secret watch (ADR 0005 Phase 3, BLOCKER-2). Label-filtered
+		// to the join-token secret-type label so a join KairosConfig is
+		// re-reconciled the moment the k0s init node pushes the token, instead of
+		// waiting for the requeue backstop. Distinct handler from the userdata
+		// Secret watch above.
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.joinTokenSecretToKairosConfig),
+			ctrlbuilder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				secret, ok := obj.(*corev1.Secret)
+				if !ok {
+					return false
+				}
+				return secret.Labels[bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeLabel] == bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeValue
+			})),
+		).
 		Watches(
 			&clusterv1.Machine{},
 			handler.EnqueueRequestsFromMapFunc(r.machineToKairosConfig),
@@ -1507,10 +1495,10 @@ func (r *KairosConfigReconciler) secretToKairosConfig(ctx context.Context, o cli
 		if *machine.Spec.Bootstrap.DataSecretName != bootstrapSecretName {
 			continue
 		}
-		if machine.Spec.Bootstrap.ConfigRef == nil {
+		if !machine.Spec.Bootstrap.ConfigRef.IsDefined() {
 			continue
 		}
-		if machine.Spec.Bootstrap.ConfigRef.GroupVersionKind().Group != bootstrapv1beta2.GroupVersion.Group {
+		if machine.Spec.Bootstrap.ConfigRef.APIGroup != bootstrapv1beta2.GroupVersion.Group {
 			continue
 		}
 		if machine.Spec.Bootstrap.ConfigRef.Kind != "KairosConfig" {
@@ -1520,13 +1508,56 @@ func (r *KairosConfigReconciler) secretToKairosConfig(ctx context.Context, o cli
 			{
 				NamespacedName: types.NamespacedName{
 					Name:      machine.Spec.Bootstrap.ConfigRef.Name,
-					Namespace: machine.Spec.Bootstrap.ConfigRef.Namespace,
+					Namespace: machine.Namespace,
 				},
 			},
 		}
 	}
 
 	return nil
+}
+
+// joinTokenSecretToKairosConfig maps the HA control-plane join-token Secret to
+// the control-plane KairosConfigs in its cluster that are waiting on the token
+// (ADR 0005 Phase 3, BLOCKER-2). It is label-filtered (the join-token
+// secret-type label + the cluster-name label), never name-suffix matched
+// (KD-15). When the k0s init node PATCHes its `k0s token create` output into the
+// Secret, this wakes every pending join KairosConfig immediately instead of
+// waiting for the 10s requeue.
+//
+// It enqueues all control-plane KairosConfigs for the cluster (a small set); the
+// reconcile itself is idempotent and no-ops for configs whose bootstrap data is
+// already generated, so over-enqueueing is harmless.
+func (r *KairosConfigReconciler) joinTokenSecretToKairosConfig(ctx context.Context, o client.Object) []reconcile.Request {
+	secret, ok := o.(*corev1.Secret)
+	if !ok {
+		return nil
+	}
+	if secret.Labels[bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeLabel] != bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeValue {
+		return nil
+	}
+	clusterName := secret.Labels[clusterv1.ClusterNameLabel]
+	if clusterName == "" {
+		return nil
+	}
+
+	kcList := &bootstrapv1beta2.KairosConfigList{}
+	if err := r.List(ctx, kcList, client.InNamespace(secret.Namespace),
+		client.MatchingLabels{clusterv1.ClusterNameLabel: clusterName}); err != nil {
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for i := range kcList.Items {
+		kc := &kcList.Items[i]
+		if kc.Spec.Role != "control-plane" {
+			continue
+		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: kc.Name, Namespace: kc.Namespace},
+		})
+	}
+	return requests
 }
 
 // machineToKairosConfig maps a Machine to its KairosConfig
@@ -1537,12 +1568,12 @@ func (r *KairosConfigReconciler) machineToKairosConfig(ctx context.Context, o cl
 	}
 
 	// Check if Machine has a bootstrap config reference
-	if machine.Spec.Bootstrap.ConfigRef == nil {
+	if !machine.Spec.Bootstrap.ConfigRef.IsDefined() {
 		return nil
 	}
 
 	// Check if it's a KairosConfig
-	if machine.Spec.Bootstrap.ConfigRef.GroupVersionKind().Group != bootstrapv1beta2.GroupVersion.Group {
+	if machine.Spec.Bootstrap.ConfigRef.APIGroup != bootstrapv1beta2.GroupVersion.Group {
 		return nil
 	}
 	if machine.Spec.Bootstrap.ConfigRef.Kind != "KairosConfig" {
@@ -1577,14 +1608,14 @@ func (r *KairosConfigReconciler) infraMachineToKairosConfig(ctx context.Context,
 	for _, machine := range machineList.Items {
 		ref := machine.Spec.InfrastructureRef
 		if ref.Kind == infraKind &&
-			ref.Name == o.GetName() && ref.Namespace == o.GetNamespace() &&
-			machine.Spec.Bootstrap.ConfigRef != nil &&
-			machine.Spec.Bootstrap.ConfigRef.GroupVersionKind().Group == bootstrapv1beta2.GroupVersion.Group &&
+			ref.Name == o.GetName() && machine.Namespace == o.GetNamespace() &&
+			machine.Spec.Bootstrap.ConfigRef.IsDefined() &&
+			machine.Spec.Bootstrap.ConfigRef.APIGroup == bootstrapv1beta2.GroupVersion.Group &&
 			machine.Spec.Bootstrap.ConfigRef.Kind == "KairosConfig" {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      machine.Spec.Bootstrap.ConfigRef.Name,
-					Namespace: machine.Spec.Bootstrap.ConfigRef.Namespace,
+					Namespace: machine.Namespace,
 				},
 			})
 		}
@@ -1603,9 +1634,9 @@ func (r *KairosConfigReconciler) getProviderID(ctx context.Context, log logr.Log
 	}
 
 	// First, check if Machine already has providerID set
-	if machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "" {
-		log.Info("Using providerID from Machine spec", "providerID", *machine.Spec.ProviderID, "machine", machine.Name)
-		return *machine.Spec.ProviderID
+	if machine.Spec.ProviderID != "" {
+		log.Info("Using providerID from Machine spec", "providerID", machine.Spec.ProviderID, "machine", machine.Name)
+		return machine.Spec.ProviderID
 	}
 
 	// Try to get providerID from infrastructure reference (e.g., VSphereMachine)
@@ -1624,7 +1655,7 @@ func (r *KairosConfigReconciler) getProviderID(ctx context.Context, log logr.Log
 		})
 		vsphereMachineKey := types.NamespacedName{
 			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
+			Namespace: machine.Namespace,
 		}
 
 		if err := r.Get(ctx, vsphereMachineKey, vsphereMachine); err != nil {
@@ -1657,46 +1688,27 @@ func (r *KairosConfigReconciler) getProviderID(ctx context.Context, log logr.Log
 
 	// For CAPK, get providerID from KubevirtMachine spec
 	if machine.Spec.InfrastructureRef.Kind == "KubevirtMachine" || machine.Spec.InfrastructureRef.Kind == "KubeVirtMachine" {
-		kubevirtMachine := &unstructured.Unstructured{}
-		kubevirtMachineGVK := machine.Spec.InfrastructureRef.GroupVersionKind()
-		if kubevirtMachineGVK.Group == "" || kubevirtMachineGVK.Version == "" {
-			kubevirtMachineGVK = schema.GroupVersionKind{
-				Group:   "infrastructure.cluster.x-k8s.io",
-				Version: "v1alpha1",
-				Kind:    "KubevirtMachine",
-			}
-		}
-		kubevirtMachine.SetGroupVersionKind(kubevirtMachineGVK)
-		kubevirtMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-
-		if err := r.Get(ctx, kubevirtMachineKey, kubevirtMachine); err != nil {
-			log.V(4).Info("Failed to get KubevirtMachine for providerID", "machine", machine.Name, "kubevirtMachine", kubevirtMachineKey.Name, "error", err)
+		kubevirtMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
+		if err != nil {
+			log.V(4).Info("Failed to get KubevirtMachine for providerID", "machine", machine.Name, "kubevirtMachine", machine.Spec.InfrastructureRef.Name, "error", err)
 			return ""
 		}
 
 		if providerID, found, err := unstructured.NestedString(kubevirtMachine.Object, "spec", "providerID"); err == nil && found && providerID != "" {
-			log.V(4).Info("Found providerID in KubevirtMachine spec", "providerID", providerID, "machine", machine.Name, "kubevirtMachine", kubevirtMachineKey.Name)
+			log.V(4).Info("Found providerID in KubevirtMachine spec", "providerID", providerID, "machine", machine.Name, "kubevirtMachine", machine.Spec.InfrastructureRef.Name)
 			return providerID
 		}
 	}
 
 	// For CAPD, get providerID from DockerMachine spec
 	if machine.Spec.InfrastructureRef.Kind == "DockerMachine" {
-		dockerMachine := &unstructured.Unstructured{}
-		dockerMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		dockerMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-		if err := r.Get(ctx, dockerMachineKey, dockerMachine); err != nil {
-			log.V(4).Info("Failed to get DockerMachine for providerID", "machine", machine.Name, "dockerMachine", dockerMachineKey.Name, "error", err)
+		dockerMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
+		if err != nil {
+			log.V(4).Info("Failed to get DockerMachine for providerID", "machine", machine.Name, "dockerMachine", machine.Spec.InfrastructureRef.Name, "error", err)
 			return ""
 		}
 		if providerID, found, err := unstructured.NestedString(dockerMachine.Object, "spec", "providerID"); err == nil && found && providerID != "" {
-			log.V(4).Info("Found providerID in DockerMachine spec", "providerID", providerID, "machine", machine.Name, "dockerMachine", dockerMachineKey.Name)
+			log.V(4).Info("Found providerID in DockerMachine spec", "providerID", providerID, "machine", machine.Name, "dockerMachine", machine.Spec.InfrastructureRef.Name)
 			return providerID
 		}
 	}

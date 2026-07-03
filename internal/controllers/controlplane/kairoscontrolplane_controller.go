@@ -35,9 +35,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/clientcmd"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"k8s.io/client-go/tools/record"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util"
-	"sigs.k8s.io/cluster-api/util/conditions"
+	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -55,10 +56,37 @@ import (
 // KairosControlPlaneReconciler reconciles a KairosControlPlane object
 type KairosControlPlaneReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
+
+	// WorkloadClientFactory builds a client for the workload cluster from its
+	// `<cluster>-kubeconfig` Secret. It backs the etcd-leave handshake (ADR 0005
+	// §E.3), which must reach the workload apiserver. nil → defaultWorkloadClient;
+	// tests inject a fake. Kept as a struct field (not a hard dependency on
+	// remote.NewClusterClient) so unit tests need no live workload cluster.
+	WorkloadClientFactory func(ctx context.Context, cluster *clusterv1.Cluster) (client.Client, error)
 }
 
 const controlPlaneLBServiceSuffix = "control-plane-lb"
+
+// joinerGateRequeueAfter is the backstop requeue interval while waiting for the
+// HA init machine to become joinable (NodeRef + KubeconfigReady, plus the k0s
+// join-token Secret) before creating the next join machine (ADR 0005 Phase 3,
+// OQ-A). The Machine and Secret watches normally wake the reconcile on the
+// relevant transitions; this is the safety net for the k0s-token-Secret-appears
+// case until that Secret lands.
+const joinerGateRequeueAfter = 15 * time.Second
+
+// The HA join-token Secret name/labels/data-key are defined once in the
+// bootstrap API package (bootstrapv1beta2) so this controller (which creates +
+// owns the Secret) and the bootstrap controller (which resolves + pushes into
+// it) agree on one name/label. Local aliases keep the call sites terse and the
+// KCP Secret-watch predicate can match by the type label (KD-15) rather than by
+// name suffix, keeping it distinct from the kubeconfig Secret.
+const (
+	controlPlaneJoinTokenSecretTypeLabel = bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeLabel
+	controlPlaneJoinTokenSecretTypeValue = bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeValue
+)
 
 // kubeconfigReadyTimeout is a package-local alias for the canonical
 // constant in the API package. The API package owns it (single source of
@@ -92,8 +120,23 @@ const kubeconfigReadyTimeout = controlplanev1beta2.KubeconfigReadyTimeout
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines/status;kubevirtmachines/status;dockermachines/status;metal3machines/status,verbs=get
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachinetemplates;kubevirtmachinetemplates;dockermachinetemplates;metal3machinetemplates,verbs=get
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspherevms,verbs=get
+// CAPI v1beta2 contract-versioned refs (ADR 0006): resolving a
+// ContractVersionedObjectReference to a served apiVersion goes through
+// external.GetObjectFromContractVersionedRef -> contract.GetGKMetadata, which
+// Gets the target resource's CustomResourceDefinition to read its contract
+// label. Every infra read (node-IP, providerID, CAPK kubeconfig) now needs this;
+// without it those Gets fail Forbidden. Read-only, cluster-scoped (CRDs are), no
+// write — matches upstream CAPI's own role.
+//+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=services;endpoints,verbs=get;list;watch;create;update;patch
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// Secrets: the KCP controller reads the workload kubeconfig Secret (KD-3b node
+// push) and rewrites its server URL, and creates/owns the HA join-token Secret
+// (ADR 0005 Phase 3) and the CAPK kubeconfig rewrite. It previously relied on
+// verbs borrowed from the sibling bootstrap controller's grant; declared here
+// explicitly. (KD-46 minimization: no delete — the join-token/kubeconfig Secrets
+// cascade via owner references, not direct deletes.)
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop
 //
@@ -230,8 +273,59 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
-	// Reconcile control plane machines
-	if err := r.reconcileMachines(ctx, log, kcp, cluster); err != nil {
+	// Resolve + persist the effective distribution BEFORE any machine creation
+	// or etcd-leave logic, so every downstream call to distributionOf(kcp) —
+	// createControlPlaneMachine, the join gate, the etcd-leave handshake — sees
+	// the resolved value without threading it through call signatures.
+	//
+	// Precedence: an explicit spec.distribution wins; otherwise inherit
+	// spec.template.spec.distribution from the referenced KairosConfigTemplate;
+	// otherwise fall back to k0s (applied downstream by distributionOf). We only
+	// PERSIST when we can actually resolve an inherited value — a missing template
+	// (or one without a distribution) leaves the field empty for this reconcile
+	// (distributionOf falls back to k0s) and a later reconcile resolves it once
+	// the template exists, rather than persisting a guessed k0s.
+	if kcp.Spec.Distribution == "" {
+		inherited, rerr := r.resolveEffectiveDistribution(ctx, kcp)
+		if rerr != nil {
+			return ctrl.Result{}, rerr
+		}
+		if inherited != "" {
+			// Persist with a dedicated MergeFrom patch, separate from the status
+			// patch helper, so this spec write is not folded into a status patch
+			// (never mix spec + status writes on the same object in one Reconcile).
+			base := kcp.DeepCopy()
+			kcp.Spec.Distribution = inherited
+			if err := r.Patch(ctx, kcp, client.MergeFrom(base)); err != nil {
+				return ctrl.Result{}, fmt.Errorf("persist inherited spec.distribution: %w", err)
+			}
+			log.Info("Inherited spec.distribution from KairosConfigTemplate",
+				"distribution", inherited, "template", kcp.Spec.KairosConfigTemplate.Name)
+			// Re-anchor the status patch helper against the post-Patch state so
+			// the deferred Patch on early-exit paths still produces a clean diff.
+			patchHelper, err = patch.NewHelper(kcp, r.Client)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			kcp.Status.ObservedGeneration = kcp.Generation
+		}
+	} else if r.Recorder != nil {
+		// An explicit spec.distribution is authoritative but MAY conflict with a
+		// distribution set only on the KairosConfigTemplate. Surface the override
+		// so operators are not surprised the template value was ignored.
+		if tmplDist, rerr := r.resolveEffectiveDistribution(ctx, kcp); rerr == nil &&
+			tmplDist != "" && tmplDist != kcp.Spec.Distribution {
+			r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "DistributionOverride",
+				"spec.distribution=%s overrides KairosConfigTemplate distribution=%s", kcp.Spec.Distribution, tmplDist)
+		}
+	}
+
+	// Reconcile control plane machines. machinesResult carries a requeue when
+	// the HA joiner-sequencing gate is holding back the next join machine
+	// (ADR 0005 Phase 3) — it is applied at the end of Reconcile so status is
+	// still refreshed while we wait for the init machine to become joinable.
+	machinesResult, err := r.reconcileMachines(ctx, log, kcp, cluster)
+	if err != nil {
 		// Use "%s" as format string and pass error as argument to satisfy linter
 		conditions.MarkFalse(kcp, clusterv1.ReadyCondition, controlplanev1beta2.ControlPlaneInitializationFailedReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
 		conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition, controlplanev1beta2.ControlPlaneInitializationFailedReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
@@ -331,6 +425,10 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition, controlplanev1beta2.WaitingForMachinesReason, clusterv1.ConditionSeverityInfo, "Waiting for control plane initialization")
 	}
 
+	// HA conditions (ADR 0005 Phase 3 + §E.4): join progress, the VIP/endpoint
+	// warning, and etcd health.
+	r.setHAConditions(ctx, kcp, cluster, endpointReady)
+
 	// Failure fields were cleared above immediately after reconcileMachines
 	// returned nil (KD-14, maintainer-confirmed decision #3). The previous
 	// `if ReadyReplicas > 0` gate at this location is intentionally removed.
@@ -367,7 +465,10 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 	}
 
-	return ctrl.Result{}, nil
+	// machinesResult carries the joiner-sequencing-gate requeue (if any). All
+	// other paths above leave it zero-valued, so this is a no-op outside the HA
+	// gate case.
+	return machinesResult, nil
 }
 
 // findClusterForControlPlane searches for a Cluster that references this KairosControlPlane
@@ -378,46 +479,35 @@ func (r *KairosControlPlaneReconciler) findClusterForControlPlane(ctx context.Co
 		return nil, fmt.Errorf("failed to list clusters: %w", err)
 	}
 
-	// Find the Cluster that references this KairosControlPlane
+	// Find the Cluster that references this KairosControlPlane.
+	//
+	// In v1beta2 the ControlPlaneRef is a ContractVersionedObjectReference: it
+	// carries only APIGroup/Kind/Name (no namespace — refs are same-namespace,
+	// and the List above is already scoped to kcp.Namespace; no version — the
+	// contract resolves it). Match on group+kind+name.
+	expectedGroup := controlplanev1beta2.GroupVersion.Group
 	for i := range clusters.Items {
 		cluster := &clusters.Items[i]
-		if cluster.Spec.ControlPlaneRef != nil &&
-			cluster.Spec.ControlPlaneRef.Kind == "KairosControlPlane" &&
-			cluster.Spec.ControlPlaneRef.Name == kcp.Name {
-			// Check namespace - it might be empty (defaults to cluster namespace)
-			refNamespace := cluster.Spec.ControlPlaneRef.Namespace
-			if refNamespace == "" || refNamespace == kcp.Namespace {
-				// Check API version/group matches
-				// In v1beta2, ControlPlaneRef uses apiGroup in YAML, but Go type uses APIVersion
-				// When apiGroup is set, APIVersion may be empty or contain the full version string
-				refAPIVersion := cluster.Spec.ControlPlaneRef.APIVersion
-				expectedGroup := controlplanev1beta2.GroupVersion.Group
-				expectedVersion := controlplanev1beta2.GroupVersion.String()
-
-				// Match if:
-				// 1. APIVersion is empty (v1beta2 using apiGroup - we trust the kind match)
-				// 2. APIVersion matches expected version (v1beta1 style or v1beta2 with full version)
-				// 3. APIVersion contains the expected group (handles partial matches)
-				if refAPIVersion == "" {
-					// Empty APIVersion means apiGroup is being used - trust the kind match
-					log.Info("Found Cluster with matching ControlPlaneRef (apiGroup)", "cluster", cluster.Name, "kind", cluster.Spec.ControlPlaneRef.Kind)
-					return cluster, nil
-				}
-				if refAPIVersion == expectedVersion {
-					return cluster, nil
-				}
-				if len(refAPIVersion) > 0 && len(expectedGroup) > 0 && len(refAPIVersion) >= len(expectedGroup) && refAPIVersion[:len(expectedGroup)] == expectedGroup {
-					return cluster, nil
-				}
-				log.Info("Cluster ControlPlaneRef APIVersion doesn't match", "cluster", cluster.Name, "refAPIVersion", refAPIVersion, "expectedVersion", expectedVersion, "expectedGroup", expectedGroup)
-			}
+		ref := cluster.Spec.ControlPlaneRef
+		if !ref.IsDefined() ||
+			ref.Kind != "KairosControlPlane" ||
+			ref.Name != kcp.Name {
+			continue
 		}
+		// An empty APIGroup is tolerated (older manifests that relied on the
+		// kind match); otherwise it must be our control-plane group.
+		if ref.APIGroup != "" && ref.APIGroup != expectedGroup {
+			log.Info("Cluster ControlPlaneRef APIGroup doesn't match", "cluster", cluster.Name, "refAPIGroup", ref.APIGroup, "expectedGroup", expectedGroup)
+			continue
+		}
+		log.Info("Found Cluster with matching ControlPlaneRef", "cluster", cluster.Name, "kind", ref.Kind)
+		return cluster, nil
 	}
 
 	return nil, nil
 }
 
-func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) error {
+func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (ctrl.Result, error) {
 	// Get desired replica count
 	desiredReplicas := int32(1)
 	if kcp.Spec.Replicas != nil {
@@ -427,7 +517,7 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 	// List existing control plane machines
 	machines, err := r.getControlPlaneMachines(ctx, kcp, cluster)
 	if err != nil {
-		return fmt.Errorf("failed to list control plane machines: %w", err)
+		return ctrl.Result{}, fmt.Errorf("failed to list control plane machines: %w", err)
 	}
 
 	// Sort machines by creation timestamp (oldest first) for stable operations
@@ -439,6 +529,45 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 
 	log.Info("Reconciling control plane machines", "desired", desiredReplicas, "current", currentReplicas)
 
+	// HA (ADR 0005 §E.3): before any scale/rollout math, progress the etcd-leave
+	// pre-terminate handshake for every owned control-plane Machine that is
+	// terminating and still carries our hook. This single sweep covers the
+	// controller's own quorum-approved deletes below, operator/MHC-initiated
+	// Machine deletes, and crash recovery — the hook keeps CAPI paused (after
+	// drain, node still up) until the member has cleanly left etcd. A workload
+	// client/read error keeps the hook set (fail-safe: the delete stays blocked
+	// and quorum is preserved) and requeues; an in-progress leave requeues so we
+	// do not churn other machines while a member is draining out of etcd.
+	for _, m := range machines {
+		if m.DeletionTimestamp.IsZero() || !hasEtcdLeaveHook(m) {
+			continue
+		}
+		done, err := r.reconcileMemberLeave(ctx, log, kcp, cluster, m)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to reconcile etcd member leave for %s: %w", m.Name, err)
+		}
+		if !done {
+			return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
+		}
+	}
+
+	// HA: ensure the per-cluster join-token Secret exists before any joiner is
+	// created (ADR 0005 Phase 3). For k3s the controller generates the shared
+	// server token up front; for k0s the Secret is created empty and the init
+	// node fills it over the node-push channel. Single-node clusters skip this.
+	if desiredReplicas > 1 {
+		if err := r.ensureJoinTokenSecret(ctx, log, kcp, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to ensure join-token secret: %w", err)
+		}
+		// HA: ensure the per-cluster etcd-status Secret exists (Cluster-owned,
+		// empty) so every control-plane node can PATCH its own member health over
+		// the node-push channel (ADR 0005 §E.1). Consumed by the joiner gate,
+		// EtcdHealthyCondition, and the quorum-safe-replacement guard.
+		if err := r.ensureEtcdStatusSecret(ctx, log, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to ensure etcd-status secret: %w", err)
+		}
+	}
+
 	maxSurge := int32(1)
 	if kcp.Spec.RolloutStrategy != nil && kcp.Spec.RolloutStrategy.RollingUpdate != nil && kcp.Spec.RolloutStrategy.RollingUpdate.MaxSurge != nil {
 		maxSurge = *kcp.Spec.RolloutStrategy.RollingUpdate.MaxSurge
@@ -448,7 +577,7 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 	updatedReadyReplicas := int32(0)
 	for _, machine := range machines {
 		if r.machineMatchesVersion(machine, kcp.Spec.Version) {
-			if machine.Status.NodeRef != nil {
+			if machine.Status.NodeRef.IsDefined() {
 				updatedReadyReplicas++
 			}
 			continue
@@ -459,59 +588,179 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 	// Rolling update behavior when machines are outdated
 	if len(outdatedMachines) > 0 {
 		if currentReplicas < desiredReplicas+maxSurge {
-			nextIndex := r.nextMachineIndex(machines, kcp.Name)
-			if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, nextIndex); err != nil {
-				return fmt.Errorf("failed to create control plane machine during rollout: %w", err)
+			role := r.controlPlaneRoleForNewMachine(desiredReplicas, machines)
+			if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to create control plane machine during rollout: %w", err)
 			}
-			return nil
+			return ctrl.Result{}, nil
 		}
 
 		// If we are above desired replicas and have enough updated/ready replicas, delete one outdated machine
 		if currentReplicas > desiredReplicas && updatedReadyReplicas >= desiredReplicas {
 			target := outdatedMachines[0]
+			// ADR 0005 §E.2: refuse a quorum-breaking rollout delete. The guard
+			// fails closed and is bypassed only under whole-cluster teardown.
+			if ok, reason, err := r.canRemoveMember(ctx, kcp, cluster, target); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to evaluate etcd quorum safety: %w", err)
+			} else if !ok {
+				log.Info("Holding back outdated-machine rollout — etcd quorum would break", "machine", target.Name, "reason", reason)
+				return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
+			}
+			// k3s embedded etcd has no supported member-remove (KD-5d); warn that
+			// the member will linger. For k0s the sweep above drives a clean
+			// `k0s etcd leave` while CAPI is paused at the pre-terminate hook.
+			r.warnIfK3sEtcdLimitation(kcp, target)
 			log.Info("Deleting outdated control plane machine", "machine", target.Name)
 			if err := r.Delete(ctx, target); err != nil {
-				return fmt.Errorf("failed to delete outdated control plane machine: %w", err)
+				return ctrl.Result{}, fmt.Errorf("failed to delete outdated control plane machine: %w", err)
 			}
-			return nil
+			return ctrl.Result{}, nil
 		}
 	}
 
 	// Create machines if needed
 	if currentReplicas < desiredReplicas {
-		toCreate := desiredReplicas - currentReplicas
-		if toCreate > 0 {
-			nextIndex := r.nextMachineIndex(machines, kcp.Name)
-			if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, nextIndex); err != nil {
-				return fmt.Errorf("failed to create control plane machine: %w", err)
+		role := r.controlPlaneRoleForNewMachine(desiredReplicas, machines)
+
+		// HA joiner-sequencing gate (ADR 0005 Phase 3, OQ-A): a join machine is
+		// not created until the init machine is joinable — NodeRef set,
+		// KubeconfigReady, and (k0s) the controller-join token Secret populated.
+		// Creating a joiner before the init endpoint exists would fail the join.
+		if role == bootstrapv1beta2.ControlPlaneRoleJoin {
+			joinable, reason, err := r.initMachineJoinable(ctx, kcp, cluster, machines)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to evaluate init machine joinability: %w", err)
 			}
-			// Only create one per reconcile to avoid over-scaling
-			return nil
+			if !joinable {
+				log.Info("Holding back join machine until init machine is joinable", "reason", reason)
+				return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
+			}
 		}
+
+		if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to create control plane machine: %w", err)
+		}
+		// Only create one per reconcile to avoid over-scaling
+		return ctrl.Result{}, nil
 	}
 
 	// Delete machines if needed (scale down)
 	if currentReplicas > desiredReplicas {
 		target := r.selectMachineForDeletion(machines, outdatedMachines)
 		if target != nil {
+			// ADR 0005 §E.2: refuse a quorum-breaking scale-down. The guard fails
+			// closed and is bypassed only under whole-cluster teardown.
+			if ok, reason, err := r.canRemoveMember(ctx, kcp, cluster, target); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to evaluate etcd quorum safety: %w", err)
+			} else if !ok {
+				log.Info("Holding back control-plane scale-down — etcd quorum would break", "machine", target.Name, "reason", reason)
+				return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
+			}
+			// k3s embedded etcd has no supported member-remove (KD-5d); warn that
+			// the member will linger. For k0s the sweep above drives a clean
+			// `k0s etcd leave` while CAPI is paused at the pre-terminate hook.
+			r.warnIfK3sEtcdLimitation(kcp, target)
 			log.Info("Scaling down control plane machine", "machine", target.Name)
 			if err := r.Delete(ctx, target); err != nil {
-				return fmt.Errorf("failed to delete control plane machine: %w", err)
+				return ctrl.Result{}, fmt.Errorf("failed to delete control plane machine: %w", err)
 			}
 		}
 	}
 
-	return nil
+	return ctrl.Result{}, nil
 }
 
-func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, index int32) error {
-	machineName := fmt.Sprintf("%s-%d", kcp.Name, index)
+// controlPlaneRoleForNewMachine decides the ControlPlaneRole for the next
+// control-plane machine to be created (ADR 0005 Phase 3, scope §1):
+//   - replicas == 1 → single (no etcd cluster).
+//   - replicas > 1 and no machine exists yet → init (the oldest CP machine).
+//   - replicas > 1 and at least one machine exists → join.
+//
+// The decision resolves against the EXISTING sorted machine set, not the name
+// index, so a deleted-and-recreated machine-0 cannot accidentally yield two
+// init nodes.
+func (r *KairosControlPlaneReconciler) controlPlaneRoleForNewMachine(desiredReplicas int32, existing []*clusterv1.Machine) bootstrapv1beta2.ControlPlaneRole {
+	if desiredReplicas <= 1 {
+		return bootstrapv1beta2.ControlPlaneRoleSingle
+	}
+	if len(existing) == 0 {
+		return bootstrapv1beta2.ControlPlaneRoleInit
+	}
+	return bootstrapv1beta2.ControlPlaneRoleJoin
+}
 
-	// Create KairosConfig
+// initMachineJoinable reports whether the HA init machine (the oldest CP
+// machine) is ready to accept joiners. The gate is (ADR 0005 Phase 3, OQ-A):
+//   - the init machine has Status.NodeRef set (it registered as a Node), AND
+//   - KubeconfigReadyCondition is True on the KCP (the node pushed its
+//     kubeconfig — KD-3b), AND
+//   - for k0s only, the join-token Secret has a non-empty token (the init node
+//     minted `k0s token create` and pushed it back). For k3s the token is
+//     controller-generated up front, so this clause is skipped, AND
+//   - the init node has reported a healthy voting etcd member into the
+//     etcd-status Secret (ADR 0005 §E.1) — strict for k0s (authoritative
+//     `k0s etcd member-list`), advisory for k3s (block only on an explicit
+//     unhealthy report; a missing report never regresses k3s bring-up).
+//
+// reason is a short human-readable explanation when not joinable (for
+// logging/conditions).
+func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine) (bool, string, error) {
+	if len(machines) == 0 {
+		return false, "init machine not created yet", nil
+	}
+	init := machines[0] // oldest-first sorted by caller
+	if !init.Status.NodeRef.IsDefined() {
+		return false, "init machine has no NodeRef yet", nil
+	}
+	if !conditions.IsTrue(kcp, controlplanev1beta2.KubeconfigReadyCondition) {
+		return false, "kubeconfig not yet observed (KubeconfigReady not True)", nil
+	}
+
 	distribution := kcp.Spec.Distribution
 	if distribution == "" {
 		distribution = "k0s"
 	}
+	if distribution == "k0s" {
+		token, err := r.joinTokenSecretValue(ctx, cluster)
+		if err != nil {
+			return false, "", err
+		}
+		if token == "" {
+			return false, "k0s controller-join token not yet pushed by init node", nil
+		}
+	}
+
+	// ADR 0005 §E.1: gate joiners on the init node having reported a healthy,
+	// voting etcd member into the etcd-status Secret (node-push; no etcd dial).
+	// This prevents cutting a joiner loose to `--server` into an init whose etcd
+	// is not yet a stable quorum member.
+	etcdStatus, err := r.readEtcdStatus(ctx, cluster)
+	if err != nil {
+		return false, "", err
+	}
+	initMember, reported := etcdStatus[init.Status.NodeRef.Name]
+	if distribution == "k0s" {
+		// k0s is authoritative (`k0s etcd member-list`): require a healthy voting
+		// report before opening the gate.
+		if !reported || !initMember.Healthy || !initMember.Voting {
+			return false, "init node has not yet reported a healthy voting etcd member", nil
+		}
+	} else {
+		// k3s is health-only best-effort (KD-5d): only block if the init HAS
+		// reported and explicitly says unhealthy. A missing report falls through
+		// so k3s bring-up is never regressed by the reporter's best-effort nature.
+		if reported && (!initMember.Healthy || !initMember.Voting) {
+			return false, "init node reported an unhealthy etcd member", nil
+		}
+	}
+	return true, "", nil
+}
+
+func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, index int32, role bootstrapv1beta2.ControlPlaneRole) error {
+	machineName := fmt.Sprintf("%s-%d", kcp.Name, index)
+
+	// Create KairosConfig
+	distribution := distributionOf(kcp)
 	kairosConfig := &bootstrapv1beta2.KairosConfig{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-%d", kcp.Name, index),
@@ -531,15 +780,9 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 		},
 	}
 
-	// Determine single-node mode from replicas
-	replicas := int32(1)
-	if kcp.Spec.Replicas != nil {
-		replicas = *kcp.Spec.Replicas
-	}
-	kairosConfig.Spec.SingleNode = (replicas == 1)
-	log.Info("Setting SingleNode flag", "singleNode", kairosConfig.Spec.SingleNode, "replicas", replicas)
-
-	// If there's a template, merge its spec
+	// If there's a template, merge its spec. This replaces kairosConfig.Spec
+	// wholesale, so the HA wiring below (role, SingleNode, token ref, VIP) MUST
+	// run AFTER this block to stay authoritative.
 	if kcp.Spec.KairosConfigTemplate.Name != "" {
 		template := &bootstrapv1beta2.KairosConfigTemplate{}
 		templateKey := types.NamespacedName{
@@ -554,9 +797,14 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 		kairosConfig.Spec.Role = "control-plane"
 		kairosConfig.Spec.Distribution = distribution
 		kairosConfig.Spec.KubernetesVersion = kcp.Spec.Version
-		// Override SingleNode based on replicas (replicas takes precedence)
-		kairosConfig.Spec.SingleNode = (replicas == 1)
 	}
+
+	// HA wiring (ADR 0005 Phase 3). The role decides single/init/join; SingleNode
+	// is kept in sync for back-compat with templates that still branch on it
+	// (KD-39 retires it in v1beta3). The bootstrap renderer reads ControlPlaneRole
+	// only when Role == "control-plane" (CPR-INV-1), which holds here.
+	r.applyControlPlaneHASpec(&kairosConfig.Spec, kcp, cluster, role)
+	log.Info("Assigned control-plane role", "role", role, "singleNode", kairosConfig.Spec.SingleNode)
 
 	if err := r.Create(ctx, kairosConfig); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
@@ -585,22 +833,33 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 		},
 		Spec: clusterv1.MachineSpec{
 			ClusterName: cluster.Name,
-			Version:     &kcp.Spec.Version,
+			Version:     kcp.Spec.Version,
 			Bootstrap: clusterv1.Bootstrap{
-				ConfigRef: &corev1.ObjectReference{
-					APIVersion: bootstrapv1beta2.GroupVersion.String(),
-					Kind:       "KairosConfig",
-					Name:       kairosConfig.Name,
-					Namespace:  kairosConfig.Namespace,
+				ConfigRef: clusterv1.ContractVersionedObjectReference{
+					APIGroup: bootstrapv1beta2.GroupVersion.Group,
+					Kind:     "KairosConfig",
+					Name:     kairosConfig.Name,
 				},
 			},
-			InfrastructureRef: corev1.ObjectReference{
-				APIVersion: infraMachine.GetObjectKind().GroupVersionKind().GroupVersion().String(),
-				Kind:       infraMachine.GetObjectKind().GroupVersionKind().Kind,
-				Name:       infraMachine.GetName(),
-				Namespace:  infraMachine.GetNamespace(),
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: infraMachine.GetObjectKind().GroupVersionKind().Group,
+				Kind:     infraMachine.GetObjectKind().GroupVersionKind().Kind,
+				Name:     infraMachine.GetName(),
 			},
 		},
+	}
+
+	// HA (ADR 0005 §E.3): stamp the etcd-leave pre-terminate hook on k0s HA
+	// control-plane Machines so CAPI pauses termination after drain (node still
+	// up) until the controller has driven a clean `k0s etcd leave`. Only k0s
+	// init/join are hooked — single-node has no etcd cluster and k3s has no
+	// supported member-remove (KD-5d). The empty annotation value is the CAPI
+	// convention for a hook awaiting external completion.
+	if shouldStampEtcdLeaveHook(kcp, role) {
+		if machine.Annotations == nil {
+			machine.Annotations = map[string]string{}
+		}
+		machine.Annotations[etcdLeaveHookAnnotation()] = ""
 	}
 
 	return r.Create(ctx, machine)
@@ -614,17 +873,17 @@ func (r *KairosControlPlaneReconciler) createInfrastructureMachine(ctx context.C
 		clusterv1.ClusterNameLabel:         cluster.Name,
 		clusterv1.MachineControlPlaneLabel: "",
 	}
-	// Merge with template metadata labels
-	if kcp.Spec.MachineTemplate.Metadata.Labels != nil {
-		for k, v := range kcp.Spec.MachineTemplate.Metadata.Labels {
+	// Merge with template metadata labels (Metadata is an optional pointer).
+	if md := kcp.Spec.MachineTemplate.Metadata; md != nil {
+		for k, v := range md.Labels {
 			labels[k] = v
 		}
 	}
 
 	annotations := map[string]string{}
-	// Merge with template metadata annotations
-	if kcp.Spec.MachineTemplate.Metadata.Annotations != nil {
-		for k, v := range kcp.Spec.MachineTemplate.Metadata.Annotations {
+	// Merge with template metadata annotations (Metadata is an optional pointer).
+	if md := kcp.Spec.MachineTemplate.Metadata; md != nil {
+		for k, v := range md.Annotations {
 			annotations[k] = v
 		}
 	}
@@ -689,10 +948,10 @@ func (r *KairosControlPlaneReconciler) getControlPlaneMachines(ctx context.Conte
 }
 
 func (r *KairosControlPlaneReconciler) machineMatchesVersion(machine *clusterv1.Machine, desiredVersion string) bool {
-	if machine.Spec.Version == nil {
+	if machine.Spec.Version == "" {
 		return false
 	}
-	return *machine.Spec.Version == desiredVersion
+	return machine.Spec.Version == desiredVersion
 }
 
 func (r *KairosControlPlaneReconciler) nextMachineIndex(machines []*clusterv1.Machine, kcpName string) int32 {
@@ -726,6 +985,71 @@ func (r *KairosControlPlaneReconciler) selectMachineForDeletion(machines []*clus
 	return machines[len(machines)-1]
 }
 
+// setHAConditions surfaces the two HA-specific conditions (ADR 0005 Phase 3) on
+// a multi-replica control plane. They are no-ops for single-node clusters.
+//
+//   - ControlPlaneJoinedCondition: True once readyReplicas == desiredReplicas;
+//     False(Info, "n/N joined") while scaling up.
+//   - AvailableCondition: marked False(Warning, WaitingForVIPOrExternalEndpoint)
+//     when an HA control plane on non-KubeVirt infra has neither a spec.ha.vip
+//     block nor an already-populated control-plane endpoint — it then has no
+//     stable floatable endpoint. CAPK is exempt (its LB Service is the
+//     endpoint). This does not block reconciliation; it is operator guidance.
+func (r *KairosControlPlaneReconciler) setHAConditions(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, endpointReady bool) {
+	desiredReplicas := int32(1)
+	if kcp.Spec.Replicas != nil {
+		desiredReplicas = *kcp.Spec.Replicas
+	}
+	if desiredReplicas <= 1 {
+		return // single-node: no HA conditions.
+	}
+
+	if kcp.Status.ReadyReplicas >= desiredReplicas {
+		conditions.MarkTrue(kcp, controlplanev1beta2.ControlPlaneJoinedCondition)
+	} else {
+		conditions.MarkFalse(kcp, controlplanev1beta2.ControlPlaneJoinedCondition,
+			controlplanev1beta2.ControlPlaneJoiningReason, clusterv1.ConditionSeverityInfo,
+			"%d/%d control-plane members joined", kcp.Status.ReadyReplicas, desiredReplicas)
+	}
+
+	// VIP/endpoint warning: the controller CAN see the infra kind here (unlike
+	// the webhook), so it gates on it. CAPK uses its built-in LoadBalancer
+	// Service and is exempt. A populated endpoint (operator chose external LB)
+	// also satisfies the requirement.
+	hasVIP := kcp.Spec.HA != nil && kcp.Spec.HA.VIP != nil
+	if !isKubevirtControlPlane(kcp) && !hasVIP && !endpointReady {
+		conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition,
+			controlplanev1beta2.WaitingForVIPOrExternalEndpointReason, clusterv1.ConditionSeverityWarning,
+			"HA control plane (replicas=%d) has no spec.ha.vip and no control-plane endpoint yet; "+
+				"set spec.ha.vip for kube-vip, or point the InfraCluster endpoint at an external load balancer",
+			desiredReplicas)
+	}
+
+	// EtcdHealthyCondition (ADR 0005 §E.4): derived from the node-reported
+	// etcd-status Secret's healthy+voting member count against the quorum
+	// minimum. Best-effort — a transient Secret read error leaves the condition
+	// unchanged rather than failing the reconcile.
+	etcdStatus, err := r.readEtcdStatus(ctx, cluster)
+	if err != nil {
+		return
+	}
+	voting := etcdVotingHealthyCount(etcdStatus)
+	quorum := desiredReplicas/2 + 1
+	switch {
+	case int32(voting) >= desiredReplicas:
+		conditions.MarkTrue(kcp, controlplanev1beta2.EtcdHealthyCondition)
+	case int32(voting) > quorum:
+		conditions.MarkFalse(kcp, controlplanev1beta2.EtcdHealthyCondition,
+			controlplanev1beta2.EtcdQuorumDegradedReason, clusterv1.ConditionSeverityInfo,
+			"%d/%d etcd members healthy", voting, desiredReplicas)
+	default: // at or below the (N/2)+1 quorum minimum (also the not-yet-formed window)
+		conditions.MarkFalse(kcp, controlplanev1beta2.EtcdHealthyCondition,
+			controlplanev1beta2.EtcdQuorumAtRiskReason, clusterv1.ConditionSeverityWarning,
+			"%d/%d etcd members healthy — at or below the quorum minimum ((N/2)+1=%d)",
+			voting, desiredReplicas, quorum)
+	}
+}
+
 func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) error {
 	machines, err := r.getControlPlaneMachines(ctx, kcp, cluster)
 	if err != nil {
@@ -736,23 +1060,38 @@ func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log log
 
 	readyReplicas := int32(0)
 	updatedReplicas := int32(0)
-	unavailableReplicas := int32(0)
-
+	availableReplicas := int32(0)
 	for _, machine := range machines {
 		// Check if machine is ready (has NodeRef)
-		if machine.Status.NodeRef != nil {
+		if machine.Status.NodeRef.IsDefined() {
 			readyReplicas++
 		}
 
 		// Check if machine is updated (matches desired version)
-		if machine.Spec.Version != nil && *machine.Spec.Version == kcp.Spec.Version {
+		if machine.Spec.Version != "" && machine.Spec.Version == kcp.Spec.Version {
 			updatedReplicas++
 		}
 
-		// Check if machine is unavailable
-		if machine.Status.Phase != string(clusterv1.MachinePhaseRunning) {
-			unavailableReplicas++
+		// Available = ready (NodeRef set), Running phase, and not being deleted.
+		if machine.Status.NodeRef.IsDefined() &&
+			machine.Status.Phase == string(clusterv1.MachinePhaseRunning) &&
+			machine.DeletionTimestamp.IsZero() {
+			availableReplicas++
 		}
+	}
+
+	// unavailableReplicas is measured against DESIRED, not the actual machine
+	// count (ADR 0005 §E.4). During an add-before-remove surge the actual count
+	// transiently exceeds desired; counting every non-Running machine then
+	// double-counted the surge node as unavailable. Contract semantics:
+	// unavailable = replicas not available toward the desired spec, floored at 0.
+	desiredReplicas := int32(1)
+	if kcp.Spec.Replicas != nil {
+		desiredReplicas = *kcp.Spec.Replicas
+	}
+	unavailableReplicas := desiredReplicas - availableReplicas
+	if unavailableReplicas < 0 {
+		unavailableReplicas = 0
 	}
 
 	// ReadyReplicas should only be counted when NodeRef is actually set
@@ -765,6 +1104,7 @@ func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log log
 	kcp.Status.ReadyReplicas = readyReplicas
 	kcp.Status.UpdatedReplicas = updatedReplicas
 	kcp.Status.UnavailableReplicas = unavailableReplicas
+	kcp.Status.AvailableReplicas = availableReplicas
 
 	selector := labels.SelectorFromSet(map[string]string{
 		clusterv1.ClusterNameLabel:         cluster.Name,
@@ -1362,6 +1702,16 @@ func (r *KairosControlPlaneReconciler) triggerClusterReconciliation(ctx context.
 // bypass the deferred Patch -- this path has already finalized the object
 // via a bare r.Update and a follow-up Patch would race with apiserver GC.
 func (r *KairosControlPlaneReconciler) reconcileDelete(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane) (ctrl.Result, bool, error) {
+	// ADR 0005 §E.3 (LOAD-BEARING): strip the etcd-leave pre-terminate hook from
+	// every owned Machine BEFORE draining. The hook pauses CAPI termination, and
+	// only the non-delete-path sweep (reconcileMachines) removes it during normal
+	// operation — so on whole-cluster teardown it would deadlock the drain.
+	// Teardown discards etcd wholesale, so no per-member leave is needed.
+	if err := stripEtcdLeaveHooks(ctx, r.Client, kcp); err != nil {
+		log.Error(err, "Failed to strip etcd-leave pre-terminate hooks during teardown",
+			"kcp", kcp.Name, "namespace", kcp.Namespace, "uid", kcp.UID)
+		return ctrl.Result{}, false, err
+	}
 	remaining, err := drainOwnedMachines(ctx, r.Client, kcp)
 	if err != nil {
 		log.Error(err, "Failed to drain owned Machines",
@@ -1472,31 +1822,26 @@ func (r *KairosControlPlaneReconciler) clusterToKairosControlPlane(ctx context.C
 		return nil
 	}
 
-	if cluster.Spec.ControlPlaneRef == nil {
+	ref := cluster.Spec.ControlPlaneRef
+	if !ref.IsDefined() {
 		return nil
 	}
 
-	if cluster.Spec.ControlPlaneRef.Kind != "KairosControlPlane" {
+	if ref.Kind != "KairosControlPlane" {
 		return nil
 	}
 
-	// Check API version/group matches
-	// In v1beta2, ControlPlaneRef uses apiGroup in YAML, but Go type uses APIVersion
-	refAPIVersion := cluster.Spec.ControlPlaneRef.APIVersion
-	expectedGroup := controlplanev1beta2.GroupVersion.Group
-	expectedVersion := controlplanev1beta2.GroupVersion.String()
-
-	// Match if APIVersion is empty (v1beta2 using apiGroup), matches expected version, or contains expected group
-	if refAPIVersion != "" &&
-		refAPIVersion != expectedVersion &&
-		!(len(refAPIVersion) > 0 && len(expectedGroup) > 0 && refAPIVersion[:len(expectedGroup)] == expectedGroup) {
+	// In v1beta2 ControlPlaneRef carries only APIGroup (no version). Match on
+	// the group; tolerate an empty APIGroup for older manifests that leaned on
+	// the kind match alone.
+	if ref.APIGroup != "" && ref.APIGroup != controlplanev1beta2.GroupVersion.Group {
 		return nil
 	}
 
 	return []reconcile.Request{
 		{
 			NamespacedName: types.NamespacedName{
-				Name:      cluster.Spec.ControlPlaneRef.Name,
+				Name:      ref.Name,
 				Namespace: cluster.Namespace,
 			},
 		},
@@ -1525,7 +1870,7 @@ func (r *KairosControlPlaneReconciler) secretToKairosControlPlane(ctx context.Co
 		return nil
 	}
 
-	if cluster.Spec.ControlPlaneRef == nil || cluster.Spec.ControlPlaneRef.Kind != "KairosControlPlane" {
+	if !cluster.Spec.ControlPlaneRef.IsDefined() || cluster.Spec.ControlPlaneRef.Kind != "KairosControlPlane" {
 		return nil
 	}
 

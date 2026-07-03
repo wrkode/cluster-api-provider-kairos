@@ -26,7 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -236,10 +236,10 @@ func TestGenerateK0sCloudConfig_ControlPlaneKubeVirtBootstrapTrap(t *testing.T) 
 			Namespace: "default",
 		},
 		Spec: clusterv1.MachineSpec{
-			InfrastructureRef: corev1.ObjectReference{
-				Kind:      "KubevirtMachine",
-				Name:      "test-kubevirt-machine",
-				Namespace: "default",
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     "KubevirtMachine",
+				Name:     "test-kubevirt-machine",
 			},
 		},
 	}
@@ -578,6 +578,67 @@ func TestGenerateK0sCloudConfig_WorkerWithTokenSecretRef(t *testing.T) {
 	g.Expect(cloudConfig).To(ContainSubstring("secret-token-67890"))
 }
 
+// TestGenerateCloudConfig_WorkerIgnoresControlPlaneRole is the controller-side
+// half of CPR-INV-1: a worker KairosConfig carrying controlPlaneRole=init and a
+// VIP block (operator-poisoned or stale) MUST render a plain worker — no
+// --cluster-init, no token file, no kube-vip — because applyControlPlaneRenderData
+// no-ops on role != "control-plane". Renderer-side enforcement is separately
+// tested in internal/bootstrap (TestHA_WorkerIgnoresControlPlaneRole); this
+// proves the controller never even populates the HA TemplateData fields.
+func TestGenerateCloudConfig_WorkerIgnoresControlPlaneRole(t *testing.T) {
+	for _, dist := range []string{"k0s", "k3s"} {
+		t.Run(dist, func(t *testing.T) {
+			g := NewWithT(t)
+
+			scheme := runtime.NewScheme()
+			g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
+			g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+			g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+
+			tokenSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "worker-token", Namespace: "default"},
+				Data:       map[string][]byte{"token": []byte("worker-join-token")},
+			}
+			client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tokenSecret).Build()
+			reconciler := &KairosConfigReconciler{Client: client, Scheme: scheme}
+
+			// Hostile worker config: it carries a control-plane role + VIP that must
+			// be ignored because Role is "worker".
+			kairosConfig := &bootstrapv1beta2.KairosConfig{
+				ObjectMeta: metav1.ObjectMeta{Name: "poisoned-worker", Namespace: "default"},
+				Spec: bootstrapv1beta2.KairosConfigSpec{
+					Role:                 "worker",
+					Distribution:         dist,
+					KubernetesVersion:    "v1.30.0",
+					ControlPlaneRole:     bootstrapv1beta2.ControlPlaneRoleInit,
+					ControlPlaneVIP:      &bootstrapv1beta2.ControlPlaneVIP{Address: "192.168.1.240", Interface: "eth0", Mode: "ARP"},
+					WorkerTokenSecretRef: &bootstrapv1beta2.WorkerTokenSecretReference{Name: "worker-token", Key: "token"},
+					K3sTokenSecretRef:    &bootstrapv1beta2.WorkerTokenSecretReference{Name: "worker-token", Key: "token"},
+					UserName:             "kairos",
+				},
+			}
+			machine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Namespace: "default"}}
+			cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"}}
+
+			var (
+				out string
+				err error
+			)
+			if dist == "k0s" {
+				out, err = reconciler.generateK0sCloudConfig(context.Background(), log.Log, kairosConfig, machine, cluster, "worker", "https://control-plane:6443")
+			} else {
+				out, err = reconciler.generateK3sCloudConfig(context.Background(), log.Log, kairosConfig, machine, cluster, "worker", "https://control-plane:6443")
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+
+			for _, forbidden := range []string{"--cluster-init", "controller-token", "server-token", "kube-vip.yaml"} {
+				g.Expect(out).NotTo(ContainSubstring(forbidden),
+					"worker with controlPlaneRole=init must NOT render control-plane HA artifact %q", forbidden)
+			}
+		})
+	}
+}
+
 func TestGenerateK0sCloudConfig_WorkerTokenPrecedence(t *testing.T) {
 	g := NewWithT(t)
 
@@ -900,7 +961,7 @@ func TestGenerateK3sCloudConfig_WorkerTokenSecretMissing(t *testing.T) {
 		"https://control-plane:6443",
 	)
 
-	g.Expect(err).To(Equal(errK3sTokenNotReady))
+	g.Expect(err).To(MatchError(errTokenNotReady))
 }
 
 func TestGenerateK3sCloudConfig_ControlPlaneKubeVirtCapk(t *testing.T) {
@@ -956,10 +1017,10 @@ func TestGenerateK3sCloudConfig_ControlPlaneKubeVirtCapk(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: clusterv1.MachineSpec{
-			InfrastructureRef: corev1.ObjectReference{
-				Kind:      "KubevirtMachine",
-				Name:      "test-kubevirt-machine",
-				Namespace: "default",
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     "KubevirtMachine",
+				Name:     "test-kubevirt-machine",
 			},
 		},
 	}
@@ -1187,7 +1248,7 @@ func TestSupportsManagementEndpoint(t *testing.T) {
 	mkMachine := func(kind string) *clusterv1.Machine {
 		return &clusterv1.Machine{
 			Spec: clusterv1.MachineSpec{
-				InfrastructureRef: corev1.ObjectReference{Kind: kind},
+				InfrastructureRef: clusterv1.ContractVersionedObjectReference{Kind: kind},
 			},
 		}
 	}
@@ -1266,7 +1327,7 @@ func TestGenerateK0sCloudConfig_CapvControlPlane_RendersPushBlock(t *testing.T) 
 	machine := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Namespace: "default"},
 		Spec: clusterv1.MachineSpec{
-			InfrastructureRef: corev1.ObjectReference{Kind: "VSphereMachine"},
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{Kind: "VSphereMachine"},
 		},
 	}
 	cluster := &clusterv1.Cluster{
@@ -1322,7 +1383,7 @@ func TestGenerateK0sCloudConfig_CapkWorker_NoPushBlock(t *testing.T) {
 	machine := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Namespace: "default"},
 		Spec: clusterv1.MachineSpec{
-			InfrastructureRef: corev1.ObjectReference{Kind: "KubevirtMachine"},
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{Kind: "KubevirtMachine"},
 		},
 	}
 	cluster := &clusterv1.Cluster{

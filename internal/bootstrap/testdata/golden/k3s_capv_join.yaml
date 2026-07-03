@@ -64,76 +64,153 @@ write_files:
     content: |
       tls-san:
         - 192.168.1.240
-  # ADR 0005 (HA) join node: shared k3s server token. Sourced from .JoinToken,
-  # which the Phase-3 controller resolves from a management-cluster Secret
-  # (TOKEN-INV). Phase 2 renders it given the input; until Phase 3 wires the
-  # token this is empty and the join node cannot authenticate (valid YAML, no
-  # render-time failure). 0600: this is a cluster-join secret on disk.
+  # ADR 0005 (HA): shared k3s server token, written on BOTH init and join nodes
+  # (IsHAControlPlane) so every HA control-plane member uses the same K3S_TOKEN —
+  # the init node from --token-file (above) and joiners from --server+--token-file.
+  # Sourced from .JoinToken, which the Phase-3 controller generates once
+  # (crypto/rand) and resolves from a management-cluster Secret via *SecretRef
+  # (TOKEN-INV). The value lands here as a YAML block scalar guarded by
+  # rejectControlChars (no shquote — this is not a shell context). 0600: this is
+  # a cluster-join secret on disk.
   - path: /etc/rancher/k3s/server-token
     permissions: "0600"
     owner: root
     group: root
     content: |
       K10aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa::server:bbbbbbbbbbbbbbbbbbbbbbbb
-  # ADR 0005 (HA) kube-vip static-pod manifest (CAPV/CAPM3 only; CAPK uses its
+  # ADR 0005 § D.1 (HA) kube-vip DaemonSet + RBAC (CAPV/CAPM3 only; CAPK uses its
   # built-in LoadBalancer Service per OQ-5 and never reaches this block).
   # k3s auto-applies manifests under /var/lib/rancher/k3s/server/manifests at
-  # server start, so kube-vip comes up to own the floating control-plane VIP.
-  # The manifest is produced by kubeVIPManifest (marshaled YAML, VIP-INV-2) —
-  # no operator string is concatenated into the YAML.
+  # server start. The manifest is a multi-document set (ServiceAccount +
+  # ClusterRole + ClusterRoleBinding + DaemonSet) produced by kubeVIPManifest
+  # (marshaled YAML, VIP-INV-2) — no operator string is concatenated into the
+  # YAML. The DaemonSet runs one kube-vip per control-plane Node (k3s servers are
+  # schedulable and carry node-role.kubernetes.io/control-plane, so no
+  # --enable-worker is needed as on k0s); the instances leader-elect on the
+  # plndr-cp-lock Lease (hence the RBAC) and the leader ARPs the floating
+  # control-plane VIP, so VIP ownership fails over when the leader's Node dies.
   - path: /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
     permissions: "0644"
     owner: root
     group: root
     content: |
       apiVersion: v1
-      kind: Pod
+      kind: ServiceAccount
       metadata:
           name: kube-vip
           namespace: kube-system
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+          name: system:kube-vip-role
+      rules:
+          - apiGroups:
+              - ""
+            resources:
+              - services
+              - services/status
+              - nodes
+              - endpoints
+            verbs:
+              - get
+              - list
+              - watch
+              - update
+          - apiGroups:
+              - coordination.k8s.io
+            resources:
+              - leases
+            verbs:
+              - get
+              - list
+              - watch
+              - update
+              - create
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+          name: system:kube-vip-binding
+      roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: system:kube-vip-role
+      subjects:
+          - kind: ServiceAccount
+            name: kube-vip
+            namespace: kube-system
+      ---
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+          name: kube-vip
+          namespace: kube-system
+          labels:
+              app.kubernetes.io/name: kube-vip
       spec:
-          containers:
-              - name: kube-vip
-                image: ghcr.io/kube-vip/kube-vip:v0.8.7
-                imagePullPolicy: IfNotPresent
-                args:
-                  - manager
-                env:
-                  - name: vip_arp
-                    value: "true"
-                  - name: vip_interface
-                    value: eth0
-                  - name: address
-                    value: 192.168.1.240
-                  - name: port
-                    value: "6443"
-                  - name: cp_enable
-                    value: "true"
-                  - name: svc_enable
-                    value: "false"
-                  - name: vip_leaderelection
-                    value: "true"
-                  - name: vip_leaseduration
-                    value: "5"
-                  - name: vip_renewdeadline
-                    value: "3"
-                  - name: vip_retryperiod
-                    value: "1"
-                  - name: bgp_enable
-                    value: "false"
-                securityContext:
-                  capabilities:
-                      add:
-                          - NET_ADMIN
-                          - NET_RAW
-                volumeMounts:
-                  - mountPath: /etc/kubernetes/admin.conf
-                    name: kubeconfig
-          hostNetwork: true
-          volumes:
-              - name: kubeconfig
-                hostPath:
-                  path: /etc/kubernetes/admin.conf
+          selector:
+              matchLabels:
+                  app.kubernetes.io/name: kube-vip
+          template:
+              metadata:
+                  labels:
+                      app.kubernetes.io/name: kube-vip
+              spec:
+                  serviceAccountName: kube-vip
+                  hostNetwork: true
+                  nodeSelector:
+                      node-role.kubernetes.io/control-plane: "true"
+                  tolerations:
+                      - key: node-role.kubernetes.io/control-plane
+                        operator: Exists
+                        effect: NoSchedule
+                      - key: node-role.kubernetes.io/master
+                        operator: Exists
+                        effect: NoSchedule
+                  containers:
+                      - name: kube-vip
+                        image: ghcr.io/kube-vip/kube-vip:v0.8.7
+                        imagePullPolicy: IfNotPresent
+                        args:
+                          - manager
+                        env:
+                          - name: vip_arp
+                            value: "true"
+                          - name: vip_interface
+                            value: eth0
+                          - name: address
+                            value: 192.168.1.240
+                          - name: port
+                            value: "6443"
+                          - name: cp_enable
+                            value: "true"
+                          - name: svc_enable
+                            value: "false"
+                          - name: vip_leaderelection
+                            value: "true"
+                          - name: vip_leaseduration
+                            value: "5"
+                          - name: vip_renewdeadline
+                            value: "3"
+                          - name: vip_retryperiod
+                            value: "1"
+                          - name: bgp_enable
+                            value: "false"
+                        securityContext:
+                          capabilities:
+                              add:
+                                  - NET_ADMIN
+                                  - NET_RAW
+                        volumeMounts:
+                          - mountPath: /etc/kubernetes/admin.conf
+                            name: kubeconfig
+                  volumes:
+                      - name: kubeconfig
+                        hostPath:
+                          path: /etc/kubernetes/admin.conf
+          updateStrategy:
+              type: RollingUpdate
   - path: /usr/local/etc/hostname
     permissions: "0644"
     owner: root
@@ -276,6 +353,77 @@ write_files:
       }
       if ! push_kubeconfig; then
         echo "WARN: kubeconfig push failed; proceeding without blocking bootstrap"
+      fi
+      # ADR 0005 §E.1 (HA) etcd-health reporter — k3s HEALTH-ONLY variant (KD-5d).
+      # Every k3s server reports its own membership into the per-cluster
+      # etcd-status Secret over the node-push channel, feeding the joiner gate,
+      # EtcdHealthyCondition, and the quorum guard. k3s embedded etcd has no clean
+      # member-remove CLI, so member REMOVAL is unsupported (documented KD-5d);
+      # this reporter is read-only + best-effort. Member count is queried via
+      # etcdctl against the local embedded etcd IF etcdctl + the server certs are
+      # present; otherwise it reports healthy from server readiness (the
+      # post-bootstrap script only reaches here after k3s is up) with members=0.
+      #
+      # SECURITY: identical discipline to the k0s reporter — non-secret metadata,
+      # JSON built on-node, all management-endpoint values shquote'd, bearer token
+      # never logged, PATCHes only this node's own member key.
+      push_etcd_status() {
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "WARN: curl not available; cannot report etcd status"
+          return 1
+        fi
+        if ! command -v base64 >/dev/null 2>&1; then
+          echo "WARN: base64 not available; cannot report etcd status"
+          return 1
+        fi
+        local member_key
+        member_key=$(hostname | tr -c 'a-zA-Z0-9._-' '-')
+        # Best-effort member count via etcdctl against the local embedded etcd.
+        local healthy=true voting=true members=0
+        local etcd_dir=/var/lib/rancher/k3s/server/tls/etcd
+        if command -v etcdctl >/dev/null 2>&1 && [ -f "${etcd_dir}/server-client.crt" ]; then
+          local ml
+          ml=$(ETCDCTL_API=3 etcdctl \
+            --endpoints=https://127.0.0.1:2379 \
+            --cacert="${etcd_dir}/server-ca.crt" \
+            --cert="${etcd_dir}/server-client.crt" \
+            --key="${etcd_dir}/server-client.key" \
+            member list 2>/dev/null || true)
+          if [ -n "${ml}" ]; then
+            members=$(printf '%s\n' "${ml}" | grep -c 'started' | tr -d ' ')
+          fi
+        fi
+        local reported_at
+        reported_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        local status_json
+        status_json=$(printf '{"name":"%s","healthy":%s,"voting":%s,"members":%s,"reportedAt":"%s"}' \
+          "${member_key}" "${healthy}" "${voting}" "${members}" "${reported_at}")
+        local status_b64
+        status_b64=$(printf '%s' "${status_json}" | base64 -w 0 2>/dev/null || printf '%s' "${status_json}" | base64 | tr -d '\n')
+        local api='https://mgmt.example.com:6443'
+        local ns='default'
+        local es_name='ha-cluster-etcd-status'
+        local token='mgmt-token'
+        local patch
+        patch="{\"data\":{\"${member_key}\":\"${status_b64}\"}}"
+        local url="${api}/api/v1/namespaces/${ns}/secrets/${es_name}"
+        local status
+        status=$(curl -k -sS -o /tmp/kairos-etcdstatus-push.log -w "%{http_code}" \
+          -H "Authorization: Bearer ${token}" \
+          -H "Content-Type: application/strategic-merge-patch+json" \
+          -X PATCH \
+          --data "${patch}" \
+          "${url}" || true)
+        unset token
+        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+          echo "Reported etcd status to management secret ${ns}/${es_name} (member ${member_key})"
+          return 0
+        fi
+        echo "WARN: failed to report etcd status (status ${status})"
+        return 1
+      }
+      if ! push_etcd_status; then
+        echo "WARN: etcd-status report failed; will retry on next boot"
       fi
 
       # Mark bootstrap success for CAPI/CAPK consumers

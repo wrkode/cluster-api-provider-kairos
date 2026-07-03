@@ -29,7 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -75,6 +75,10 @@ func (f *fakeSubResourceClient) Update(_ context.Context, _ client.Object, _ ...
 
 func (f *fakeSubResourceClient) Patch(_ context.Context, _ client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
 	return errors.New("fakeSubResourceClient.Patch not implemented")
+}
+
+func (f *fakeSubResourceClient) Apply(_ context.Context, _ runtime.ApplyConfiguration, _ ...client.SubResourceApplyOption) error {
+	return errors.New("fakeSubResourceClient.Apply not implemented")
 }
 
 func newResolverScheme(t *testing.T) *runtime.Scheme {
@@ -372,4 +376,133 @@ func TestResolve_PreExistingServiceAccount_StillSucceeds(t *testing.T) {
 	sa := &corev1.ServiceAccount{}
 	g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, sa)).To(Succeed())
 	g.Expect(sa.Labels).To(HaveKeyWithValue(clusterv1.ClusterNameLabel, "test-cluster"))
+}
+
+// TestResolve_MultipleConfigsSameCluster_OwnedByCluster is the regression guard
+// for the Phase-4 multi-node bring-up blocker (ADR 0005 § D.2). The per-cluster
+// SA/Role/RoleBinding are a single object set shared by every control-plane
+// Machine's KairosConfig. When they were controller-owned by the per-Machine
+// KairosConfig, the first config (the init node) became the sole controller
+// owner and every subsequent config's Resolve failed with a
+// controllerutil.AlreadyOwnedError ("already owned by another controller"), so
+// joiners never rendered bootstrap and the cluster stalled at one node. Owning
+// by the Cluster makes Resolve idempotent across configs.
+//
+// The test drives two DISTINCT KairosConfigs (different name + UID) in the same
+// cluster: both must succeed and the three shared objects must be
+// controller-owned by the Cluster. It fails against the pre-fix kc-owned code
+// (the second Resolve returns AlreadyOwnedError on the ServiceAccount).
+func TestResolve_MultipleConfigsSameCluster_OwnedByCluster(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newResolverScheme(t)
+	sub := &fakeSubResourceClient{token: "tok"}
+	r, kc1, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+	kc1.Spec.Role = "control-plane"
+	kc1.Spec.Distribution = "k3s"
+
+	// Init node.
+	_, err := r.Resolve(context.Background(), kc1, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	// A second, distinct KairosConfig in the SAME cluster (a joiner). Different
+	// name + UID so a controller-ref owned by kc1 would conflict.
+	kc2 := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-config-2",
+			Namespace: "default",
+			UID:       "00000000-0000-0000-0000-000000000002",
+		},
+		Spec: bootstrapv1beta2.KairosConfigSpec{Role: "control-plane", Distribution: "k3s"},
+	}
+	_, err = r.Resolve(context.Background(), kc2, cluster)
+	g.Expect(err).NotTo(HaveOccurred(), "a second KairosConfig in the same cluster must not conflict on the shared RBAC objects")
+
+	// All three shared objects must be controller-owned by the Cluster, not by
+	// either KairosConfig.
+	saName := kubeconfigWriterName("test-cluster")
+	nn := types.NamespacedName{Name: saName, Namespace: "default"}
+	sa := &corev1.ServiceAccount{}
+	g.Expect(r.Client.Get(context.Background(), nn, sa)).To(Succeed())
+	role := &rbacv1.Role{}
+	g.Expect(r.Client.Get(context.Background(), nn, role)).To(Succeed())
+	rb := &rbacv1.RoleBinding{}
+	g.Expect(r.Client.Get(context.Background(), nn, rb)).To(Succeed())
+
+	for _, obj := range []client.Object{sa, role, rb} {
+		owner := metav1.GetControllerOf(obj)
+		g.Expect(owner).NotTo(BeNil(), "shared object must have a controller owner")
+		g.Expect(owner.Kind).To(Equal("Cluster"))
+		g.Expect(owner.Name).To(Equal("test-cluster"))
+	}
+}
+
+// TestResolve_GrantsEtcdStatusSecret asserts the node SA's Role is granted
+// get/update/patch (and NOT create) on the per-cluster etcd-status Secret
+// (ADR 0005 §E.1), on the same resourceNames-scoped rule as the kubeconfig +
+// join-token Secrets — a bounded named-Secret widening, no new rule.
+func TestResolve_GrantsEtcdStatusSecret(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newResolverScheme(t)
+	sub := &fakeSubResourceClient{token: "tok"}
+	r, kc, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+	kc.Spec.Role = "control-plane"
+	kc.Spec.Distribution = "k0s"
+
+	_, err := r.Resolve(context.Background(), kc, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	role := &rbacv1.Role{}
+	saName := kubeconfigWriterName("test-cluster")
+	g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, role)).To(Succeed())
+
+	etcdName := bootstrapv1beta2.EtcdStatusSecretName("test-cluster")
+	g.Expect(roleGrantsNamedSecret(role, etcdName, "get")).To(BeTrue(), "node SA must get the etcd-status Secret")
+	g.Expect(roleGrantsNamedSecret(role, etcdName, "update")).To(BeTrue(), "node SA must update the etcd-status Secret")
+	g.Expect(roleGrantsNamedSecret(role, etcdName, "patch")).To(BeTrue(), "node SA must patch the etcd-status Secret")
+	g.Expect(roleGrantsNamedSecret(role, etcdName, "create")).To(BeFalse(), "node SA must NOT create the etcd-status Secret (controller pre-creates it)")
+}
+
+// roleGrantsNamedSecret reports whether the Role grants the given verb on the
+// named core Secret via a resourceNames-scoped rule (the create rule carries no
+// resourceNames, so a create check only matches a named-create rule — which we
+// assert is absent).
+func roleGrantsNamedSecret(role *rbacv1.Role, name, verb string) bool {
+	for _, rule := range role.Rules {
+		coreGroup := false
+		for _, gp := range rule.APIGroups {
+			if gp == "" {
+				coreGroup = true
+				break
+			}
+		}
+		if !coreGroup {
+			continue
+		}
+		hasSecret := false
+		for _, res := range rule.Resources {
+			if res == "secrets" {
+				hasSecret = true
+				break
+			}
+		}
+		if !hasSecret {
+			continue
+		}
+		hasName := false
+		for _, rn := range rule.ResourceNames {
+			if rn == name {
+				hasName = true
+				break
+			}
+		}
+		if !hasName {
+			continue
+		}
+		for _, v := range rule.Verbs {
+			if v == verb {
+				return true
+			}
+		}
+	}
+	return false
 }

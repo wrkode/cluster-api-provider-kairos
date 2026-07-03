@@ -19,7 +19,7 @@ package v1beta2
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
 const (
@@ -53,9 +53,15 @@ type KairosControlPlaneSpec struct {
 	// +kubebuilder:validation:Required
 	Version string `json:"version"`
 
-	// Distribution specifies the Kubernetes distribution to install
+	// Distribution specifies the Kubernetes distribution to install.
+	//
+	// When left empty the controller resolves the effective distribution by
+	// inheriting spec.template.spec.distribution from the referenced
+	// KairosConfigTemplate; if the template does not specify one either, it
+	// defaults to k0s. An explicit value here always wins and overrides the
+	// template's distribution. There is intentionally NO CRD-level default so
+	// that "unset" (inherit) is distinguishable from an explicit "k0s".
 	// +kubebuilder:validation:Enum=k0s;k3s
-	// +kubebuilder:default=k0s
 	// +optional
 	Distribution string `json:"distribution,omitempty"`
 
@@ -211,9 +217,13 @@ type KairosControlPlaneMachineTemplate struct {
 	// +optional
 	NodeDrainTimeout *metav1.Duration `json:"nodeDrainTimeout,omitempty"`
 
-	// Metadata is the metadata to apply to the machines
+	// Metadata is the metadata to apply to the machines.
+	// A pointer so an unset value is OMITTED rather than serialized as an empty
+	// object: CAPI v1beta2's ObjectMeta type carries MinProperties=1, so a
+	// rendered empty `metadata: {}` (which a value-type field with omitempty does
+	// NOT omit) fails admission on controller writeback (ADR 0006).
 	// +optional
-	Metadata clusterv1.ObjectMeta `json:"metadata,omitempty"`
+	Metadata *clusterv1.ObjectMeta `json:"metadata,omitempty"`
 }
 
 // KairosConfigTemplateReference is a reference to a KairosConfigTemplate
@@ -366,6 +376,16 @@ type KairosControlPlaneStatus struct {
 	// +optional
 	UnavailableReplicas int32 `json:"unavailableReplicas,omitempty"`
 
+	// AvailableReplicas is the number of control plane machines that are
+	// available (ready and not being deleted). Contract: ControlPlane MUST
+	// expose availableReplicas (api/CLAUDE.md rule 1). For this provider a
+	// machine counts as available when it has a NodeRef and is in the Running
+	// phase; the value mirrors readyReplicas today but is surfaced as a distinct
+	// field per the v1beta2 contract and to give HA (replicas > 1) a clean
+	// available-vs-ready signal. (ADR 0005 Phase 3.)
+	// +optional
+	AvailableReplicas int32 `json:"availableReplicas,omitempty"`
+
 	// Conditions defines current service state of the KairosControlPlane
 	// Contract: ControlPlane SHOULD expose Conditions
 	// Standard CAPI conditions: Ready, Available, Initialized
@@ -445,12 +465,12 @@ type KairosControlPlaneList struct {
 }
 
 // GetConditions returns the set of conditions for this object.
-func (c *KairosControlPlane) GetConditions() clusterv1.Conditions {
+func (c *KairosControlPlane) GetV1Beta1Conditions() clusterv1.Conditions {
 	return c.Status.Conditions
 }
 
 // SetConditions sets the conditions on this object.
-func (c *KairosControlPlane) SetConditions(conditions clusterv1.Conditions) {
+func (c *KairosControlPlane) SetV1Beta1Conditions(conditions clusterv1.Conditions) {
 	c.Status.Conditions = conditions
 }
 

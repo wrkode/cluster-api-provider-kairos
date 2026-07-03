@@ -37,12 +37,63 @@ const (
 	//     to Warning past that threshold so operators see the stall in the
 	//     condition surface.
 	KubeconfigReadyCondition = "KubeconfigReady"
+
+	// ControlPlaneJoinedCondition reports HA join progress (ADR 0005 Phase 3).
+	// True once readyReplicas == desiredReplicas (all configured CP members have
+	// joined and registered a Node). False(Info) with an "n/N joined" message
+	// while scaling up. Not surfaced for single-node control planes.
+	ControlPlaneJoinedCondition = "ControlPlaneJoined"
+
+	// EtcdHealthyCondition reports control-plane etcd membership health for an HA
+	// control plane (ADR 0005 §E.4), derived from the node-reported etcd-status
+	// Secret. True when all desired members report healthy + voting; False(Info)
+	// when quorum holds but a member is degraded; False(Warning) at or below the
+	// (N/2)+1 quorum minimum. Not surfaced for single-node control planes.
+	EtcdHealthyCondition = "EtcdHealthy"
 )
 
 // Condition reasons
 const (
 	// WaitingForMachinesReason indicates that the control plane is waiting for machines
 	WaitingForMachinesReason = "WaitingForMachines"
+
+	// WaitingForVIPOrExternalEndpointReason is a Warning-severity reason on
+	// AvailableCondition for an HA control plane (replicas > 1) that has neither
+	// a spec.ha.vip block nor an already-populated Cluster control-plane endpoint
+	// on non-KubeVirt infrastructure (ADR 0005 Phase 3). Without one of these the
+	// HA control plane has no stable, floatable endpoint and joiners cannot reach
+	// a durable --server URL. CAPK is exempt (its LoadBalancer Service is the
+	// endpoint). External-LB HA is valid: populate the InfraCluster endpoint and
+	// this clears without a VIP.
+	WaitingForVIPOrExternalEndpointReason = "WaitingForVIPOrExternalEndpoint"
+
+	// ControlPlaneJoiningReason is the False(Info) reason on
+	// ControlPlaneJoinedCondition while HA members are still joining.
+	ControlPlaneJoiningReason = "ControlPlaneJoining"
+
+	// ControlPlaneJoinedReason is the True reason on ControlPlaneJoinedCondition
+	// once all configured HA members have joined.
+	ControlPlaneJoinedReason = "ControlPlaneJoined"
+
+	// EtcdHealthyReason is the True reason on EtcdHealthyCondition when all
+	// desired etcd members report healthy and voting (ADR 0005 §E.4).
+	EtcdHealthyReason = "EtcdHealthy"
+
+	// EtcdQuorumDegradedReason is the False(Info) reason on EtcdHealthyCondition
+	// when etcd quorum still holds but fewer than all desired members are
+	// healthy+voting.
+	EtcdQuorumDegradedReason = "EtcdQuorumDegraded"
+
+	// EtcdQuorumAtRiskReason is the False(Warning) reason on EtcdHealthyCondition
+	// when the healthy+voting member count is at or below the (N/2)+1 quorum
+	// minimum — one more loss breaks quorum. Also covers the not-yet-formed
+	// bring-up window (before members have reported).
+	EtcdQuorumAtRiskReason = "EtcdQuorumAtRisk"
+
+	// WaitingForEtcdMemberReason is the False(Info) reason surfaced while the
+	// init node has not yet reported a healthy voting etcd member (ADR 0005 §E.1,
+	// k0s joiner gate).
+	WaitingForEtcdMemberReason = "WaitingForEtcdMember"
 
 	// WaitingForMachinesReadyReason indicates that the control plane is waiting for machines to be ready
 	WaitingForMachinesReadyReason = "WaitingForMachinesReady"
